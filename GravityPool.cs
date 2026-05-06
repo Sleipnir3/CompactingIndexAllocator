@@ -9,18 +9,18 @@ namespace GameWorld.ECS
     /// 核心理念：通过最小堆（Min-Heap）确保永远优先填充物理内存中最靠前的“坑位”。
     /// 效果：自发实现内存布局的“逻辑压缩”，最大化 Cache Line 利用率并允许整块 Chunk 跳过。
     /// </summary>
-    public struct EcsGravityPool : IDisposable
+    public struct CompactingIndexAllocator : IDisposable
     {
-        // 存储已回收索引的最小堆（物理位置越靠前，索引值越小，优先级越高）
+        // 存储已回收索引的最小堆
         private NativeList<int> _freeHeap;
 
-        // 当前物理内存的最高水位线（当堆为空时，向后开辟新空间）
+        // 当前索引的最高水位线
         private NativeReference<int> _highWaterMark;
 
-        // 防双重释放与水位线退潮的核心防线：活跃掩码
+        // 活跃掩码
         private NativeBitArray _activeMask;
 
-        public EcsGravityPool(int maxCapacity, Allocator allocator)
+        public CompactingIndexAllocator(int maxCapacity, Allocator allocator)
         {
             _freeHeap = new NativeList<int>(maxCapacity, allocator);
             _highWaterMark = new NativeReference<int>(0, allocator);
@@ -28,8 +28,8 @@ namespace GameWorld.ECS
         }
 
         /// <summary>
-        /// 唤醒/获取一个物理索引
-        /// 逻辑：优先从堆中取出最小的“老坑”，同时懒惰清理已退潮的僵尸索引。
+        /// 唤醒一个物理索引
+        /// 注意，不要在并行逻辑中调用此函数
         /// </summary>
         public int Spawn()
         {
@@ -37,7 +37,7 @@ namespace GameWorld.ECS
             {
                 int minIndex = PopMin();
                 
-                // 惰性删除 (Lazy Deletion)：如果弹出的索引由于退潮已经处于或高于水位线，则直接丢弃
+                // 惰性删除 (Lazy Deletion)：直接丢弃已经处于或高于水位线的索引
                 if (minIndex < _highWaterMark.Value)
                 {
                     _activeMask.Set(minIndex, true);
@@ -51,8 +51,8 @@ namespace GameWorld.ECS
         }
 
         /// <summary>
-        /// 回收/归还一个物理索引
-        /// 逻辑：防双重释放 + 边缘退潮 (Watermark Retreat) + 压入堆。
+        /// 回收一个物理索引
+        /// 注意，不要在并行逻辑中调用此函数
         /// </summary>
         public void Despawn(int index)
         {
@@ -78,12 +78,11 @@ namespace GameWorld.ECS
                         _highWaterMark.Value--;
                     }
                     
-                    // 注意：那些被退潮越过去的闲置索引可能还在 _freeHeap 中（成为了僵尸索引）。
-                    // 我们不需要 O(N) 去堆里删它们，Spawn() 里的懒惰清理会解决它们。
+                    // tips： _freeHeap 中高于_highWaterMark 的僵尸索引在 Spawn 中处理。
                 }
                 else
                 {
-                    // 不是边缘坑位，乖乖进入重力池沉降
+                    // 不是边缘，进入沉降
                     PushHeap(index);
                 }
             }
