@@ -13,43 +13,83 @@ namespace GameWorld.ECS
     {
         // 存储已回收索引的最小堆（物理位置越靠前，索引值越小，优先级越高）
         private NativeList<int> _freeHeap;
-        
-        // 当前物理内存的最高水位线（当堆为空时，向后开辟新空间）
-        private int _highWaterMark;
 
-        public EcsGravityPool(int initialCapacity, Allocator allocator)
+        // 当前物理内存的最高水位线（当堆为空时，向后开辟新空间）
+        private NativeReference<int> _highWaterMark;
+
+        // 防双重释放与水位线退潮的核心防线：活跃掩码
+        private NativeBitArray _activeMask;
+
+        public EcsGravityPool(int maxCapacity, Allocator allocator)
         {
-            _freeHeap = new NativeList<int>(initialCapacity, allocator);
-            _highWaterMark = 0;
+            _freeHeap = new NativeList<int>(maxCapacity, allocator);
+            _highWaterMark = new NativeReference<int>(0, allocator);
+            _activeMask = new NativeBitArray(maxCapacity, allocator, NativeArrayOptions.ClearMemory);
         }
 
         /// <summary>
         /// 唤醒/获取一个物理索引
-        /// 逻辑：优先从堆中取出最小的“老坑”，若无老坑则推高水位线分配“新地”。
+        /// 逻辑：优先从堆中取出最小的“老坑”，同时懒惰清理已退潮的僵尸索引。
         /// </summary>
         public int Spawn()
         {
-            if (_freeHeap.IsCreated && _freeHeap.Length > 0)
+            while (_freeHeap.IsCreated && _freeHeap.Length > 0)
             {
-                return PopMin();
+                int minIndex = PopMin();
+                
+                // 惰性删除 (Lazy Deletion)：如果弹出的索引由于退潮已经处于或高于水位线，则直接丢弃
+                if (minIndex < _highWaterMark.Value)
+                {
+                    _activeMask.Set(minIndex, true);
+                    return minIndex;
+                }
             }
-            return _highWaterMark++;
+
+            int newIndex = _highWaterMark.Value++;
+            _activeMask.Set(newIndex, true);
+            return newIndex;
         }
 
         /// <summary>
         /// 回收/归还一个物理索引
-        /// 逻辑：将索引压入堆，堆序会自动确保该索引在下次 Spawn 时被优先考虑。
+        /// 逻辑：防双重释放 + 边缘退潮 (Watermark Retreat) + 压入堆。
         /// </summary>
         public void Despawn(int index)
         {
             // 只有低于水位线的有效索引才允许归还
-            if (index < _highWaterMark)
+            if (index < _highWaterMark.Value)
             {
-                PushHeap(index);
+                if (!_activeMask.IsSet(index))
+                {
+                    throw new InvalidOperationException($"Double Free Detected! Index {index} is already despawned.");
+                }
+                
+                _activeMask.Set(index, false);
+
+                // 核心：水位线退潮机制
+                if (index == _highWaterMark.Value - 1)
+                {
+                    // 如果正好是水位线边缘的坑位，直接退潮
+                    _highWaterMark.Value--;
+
+                    // 连续退潮：如果前面的坑位之前也已经空了，继续回缩水位线
+                    while (_highWaterMark.Value > 0 && !_activeMask.IsSet(_highWaterMark.Value - 1))
+                    {
+                        _highWaterMark.Value--;
+                    }
+                    
+                    // 注意：那些被退潮越过去的闲置索引可能还在 _freeHeap 中（成为了僵尸索引）。
+                    // 我们不需要 O(N) 去堆里删它们，Spawn() 里的懒惰清理会解决它们。
+                }
+                else
+                {
+                    // 不是边缘坑位，乖乖进入重力池沉降
+                    PushHeap(index);
+                }
             }
         }
 
-        public int GetActiveTotalCapacity() => _highWaterMark;
+        public int GetActiveTotalCapacity() => _highWaterMark.Value;
         public int GetFreeCount() => _freeHeap.Length;
 
         #region 内部堆算法 (Min-Heap Logic)
@@ -89,7 +129,7 @@ namespace GameWorld.ECS
                     int rightChild = (parentIdx << 1) + 2;
                     if (leftChild >= _freeHeap.Length) break;
 
-                    int smallestChild = (rightChild < _freeHeap.Length && _freeHeap[rightChild] < _freeHeap[leftChild]) 
+                    int smallestChild = (rightChild < _freeHeap.Length && _freeHeap[rightChild] < _freeHeap[leftChild])
                                         ? rightChild : leftChild;
 
                     if (_freeHeap[parentIdx] <= _freeHeap[smallestChild]) break;
@@ -109,6 +149,8 @@ namespace GameWorld.ECS
         public void Dispose()
         {
             if (_freeHeap.IsCreated) _freeHeap.Dispose();
+            if (_highWaterMark.IsCreated) _highWaterMark.Dispose();
+            if (_activeMask.IsCreated) _activeMask.Dispose();
         }
     }
 }
