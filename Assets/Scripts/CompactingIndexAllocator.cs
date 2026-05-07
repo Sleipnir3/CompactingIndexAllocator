@@ -14,7 +14,7 @@ namespace GameWorld.ECS
         private NativeList<int> _freeHeap;
 
         // 当前索引的最高位
-        private NativeReference<int> _highWaterMark;
+        private NativeReference<int> _highIndexMark;
 
         // 活跃掩码
         private NativeBitArray _activeMask;
@@ -22,7 +22,7 @@ namespace GameWorld.ECS
         public CompactingIndexAllocator(int maxCapacity, Allocator allocator)
         {
             _freeHeap = new NativeList<int>(maxCapacity, allocator);
-            _highWaterMark = new NativeReference<int>(0, allocator);
+            _highIndexMark = new NativeReference<int>(0, allocator);
             _activeMask = new NativeBitArray(maxCapacity, allocator, NativeArrayOptions.ClearMemory);
         }
 
@@ -36,15 +36,15 @@ namespace GameWorld.ECS
             {
                 int minIndex = PopMin();
                 
-                // 惰性删除 (Lazy Deletion)：直接丢弃已经处于或高于水位线的索引
-                if (minIndex < _highWaterMark.Value)
+                // 惰性删除：移除掉高位的无效索引
+                if (minIndex < _highIndexMark.Value)
                 {
                     _activeMask.Set(minIndex, true);
                     return minIndex;
                 }
             }
 
-            int newIndex = _highWaterMark.Value++;
+            int newIndex = _highIndexMark.Value++;
             _activeMask.Set(newIndex, true);
             return newIndex;
         }
@@ -55,39 +55,40 @@ namespace GameWorld.ECS
         /// </summary>
         public void Despawn(int index)
         {
-            // 只有低于水位线的有效索引才允许归还
-            if (index < _highWaterMark.Value)
+            // 首先检查索引合法性。
+            if (!_activeMask.IsSet(index))
             {
-                if (!_activeMask.IsSet(index))
+                // 抛出异常，向顶层汇报这个逻辑错误。
+                // 这种检查必须在任何条件判断之前，确保双重释放总是被捕获。
+                throw new InvalidOperationException($"Double Free Detected or Invalid Index! Index {index} is not active.");
+            }
+            
+       
+            _activeMask.Set(index, false);
+
+            // 尝试退回最高索引位置或加入空闲堆。
+            // 判断是否是当前的边缘索引。
+            // 注意：这里需要使用 Despawn 前的 _highWaterMark.Value 进行判断。
+            if (index == _highIndexMark.Value - 1)
+            {
+                _highIndexMark.Value--;
+                // 连续嗅探：如果前面的坑位之前也已经空了，继续回缩最高索引线
+                // 循环条件要检查 _highWaterMark.Value > 0，因为如果退到 0 就不能再检查 _highWaterMark.Value - 1 了。
+                while (_highIndexMark.Value > 0 && !_activeMask.IsSet(_highIndexMark.Value - 1))
                 {
-                    throw new InvalidOperationException($"Double Free Detected! Index {index} is already despawned.");
+                    _highIndexMark.Value--;
                 }
                 
-                _activeMask.Set(index, false);
-
-                // 核心：水位线退潮机制
-                if (index == _highWaterMark.Value - 1)
-                {
-                    // 如果正好是水位线边缘的坑位，直接退潮
-                    _highWaterMark.Value--;
-
-                    // 连续退潮：如果前面的坑位之前也已经空了，继续回缩水位线
-                    while (_highWaterMark.Value > 0 && !_activeMask.IsSet(_highWaterMark.Value - 1))
-                    {
-                        _highWaterMark.Value--;
-                    }
-                    
-                    // tips： _freeHeap 中高于_highWaterMark 的无效索引将在 Spawn 中处理。
-                }
-                else
-                {
-                    // 不是边缘，进入沉降
-                    PushHeap(index);
-                }
+                // tips： _freeHeap 中高于_highWaterMark 的无效索引将在 Spawn 中处理。
+            }
+            else if (index < _highIndexMark.Value)
+            {
+                // 不是边缘，进入沉降
+                PushHeap(index);
             }
         }
 
-        public int GetActiveTotalCapacity() => _highWaterMark.Value;
+        public int GetActiveTotalCapacity() => _highIndexMark.Value;
         public int GetFreeCount() => _freeHeap.Length;
 
         #region 内部堆算法 (Min-Heap Logic)
@@ -147,7 +148,7 @@ namespace GameWorld.ECS
         public void Dispose()
         {
             if (_freeHeap.IsCreated) _freeHeap.Dispose();
-            if (_highWaterMark.IsCreated) _highWaterMark.Dispose();
+            if (_highIndexMark.IsCreated) _highIndexMark.Dispose();
             if (_activeMask.IsCreated) _activeMask.Dispose();
         }
     }
