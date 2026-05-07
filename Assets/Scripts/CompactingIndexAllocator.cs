@@ -5,16 +5,15 @@ using System;
 namespace GameWorld.ECS
 {
     /// <summary>
-    /// 重力索引池 ( Gravity Pool)
-    /// 核心理念：通过最小堆（Min-Heap）确保永远优先填充物理内存中最靠前的“坑位”。
-    /// 效果：自发实现内存布局的“逻辑压缩”，最大化 Cache Line 利用率并允许整块 Chunk 跳过。
+    /// 重力索引 ( Gravity Index)
+    /// 通过最小堆（Min-Heap）确保永远优先填充物理内存中最靠前的位置,有效避免内存碎片。
     /// </summary>
     public struct CompactingIndexAllocator : IDisposable
     {
         // 存储已回收索引的最小堆
         private NativeList<int> _freeHeap;
 
-        // 当前索引的最高水位线
+        // 当前索引的最高位
         private NativeReference<int> _highWaterMark;
 
         // 活跃掩码
@@ -78,7 +77,7 @@ namespace GameWorld.ECS
                         _highWaterMark.Value--;
                     }
                     
-                    // tips： _freeHeap 中高于_highWaterMark 的僵尸索引在 Spawn 中处理。
+                    // tips： _freeHeap 中高于_highWaterMark 的无效索引将在 Spawn 中处理。
                 }
                 else
                 {
